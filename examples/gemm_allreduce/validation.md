@@ -49,15 +49,3 @@ unique-id bootstrap、对称内存成功释放顺序。codegen_ascend.cc 无本�
 原 2026-10-28 记录仅保留为历史记录；其中引用的
 `testing/python/language/test_tilelang_ascend_language_shmem_view.py` 当前仓库不存在，
 不属于本次新增内容或本次验证结果。
-
-### 同日更新：统一精度约定（替代上节 FP16 局部输出基线）
-
-- 基线改用 `aten.mm.dtype_out(..., torch.float32, out=...)`，直接产生 FP32 局部输出，
-  再串行执行 FP32 HCCL SUM。移除 half 中间缓冲、cast 和单独的舍入 golden。
-- 两条路径测量前后使用同一个 `make_case` FP32 golden 和同一个 `compare` 容差。
-- 增加 NPU FP32 结果探针；不支持显式 output-dtype overload 或探针失败时，两 rank
-  一致停止，不回退到低精度基线。探针不能证明任意输入下所有内部累加均为 FP32。
-- CPU unittest：10/10 通过，新增覆盖显式 FP32 overload、拒绝 half 输出再 cast 的
-  探针（使用 NumPy mock，不代表设备通过）、缺少接口时禁止回退。
-- CLI help、两 Python 文件 AST/行宽及主仓 diff 空白检查：通过。
-- 真机探针、目标 CANN 内部 FP32 累加路径、两卡精度和时延：仍未验证，无性能结论。

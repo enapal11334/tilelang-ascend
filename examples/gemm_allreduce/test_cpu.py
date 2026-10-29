@@ -7,9 +7,7 @@ import numpy as np
 
 from gemm_allreduce_config import validate_shape, workspace_shapes
 from test_gemm_allreduce import compare, make_case
-from benchmark_gemm_allreduce import (
-    check_fp32_mm, check_precision, fp32_mm_operator, serial_step, summarize,
-)
+from benchmark_gemm_allreduce import check_precision, serial_step, summarize, unfused_reference
 
 
 class TestContract(unittest.TestCase):
@@ -76,44 +74,12 @@ class TestBenchmark(unittest.TestCase):
             with self.subTest(samples=samples), self.assertRaises(ValueError):
                 summarize(samples)
 
-    def test_missing_fp32_overload_has_no_fallback(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "no FP16 fallback"):
-            fp32_mm_operator(SimpleNamespace())
-
-    def test_fp32_probe_rejects_half_output_then_cast(self) -> None:
-        class Tensor:
-            def __init__(self, array):
-                self.array = array
-                self.dtype = array.dtype
-
-            def to(self, device):
-                return self
-
-            def __getitem__(self, index):
-                return self.array[index]
-
-        def gather(objects, error):
-            objects[:] = [error, error]
-
-        for round_half in (False, True):
-            def mm(a, b, dtype, *, out):
-                self.assertEqual(dtype, np.float32)
-                value = a.array.astype(np.float32) @ b.array.astype(np.float32)
-                out.array[:] = value.astype(np.float16) if round_half else value
-
-            torch = SimpleNamespace(
-                float32=np.float32,
-                from_numpy=Tensor,
-                empty=lambda shape, *, dtype, device: Tensor(np.empty(shape, dtype=dtype)),
-                npu=SimpleNamespace(synchronize=lambda: None),
-                ops=SimpleNamespace(aten=SimpleNamespace(mm=SimpleNamespace(dtype_out=mm))),
-            )
-            dist = SimpleNamespace(all_gather_object=gather)
-            if round_half:
-                with self.assertRaisesRegex(RuntimeError, "FP32 local result"):
-                    check_fp32_mm(torch, dist, "mock")
-            else:
-                check_fp32_mm(torch, dist, "mock")
+    def test_baseline_reference_models_half_rounding(self) -> None:
+        a, w, expected = make_case(32, 64, 64, "random")
+        partials = [a[r].astype(np.float64) @ w[r].astype(np.float64).T for r in range(2)]
+        rounded = sum(p.astype(np.float16).astype(np.float32) for p in partials)
+        compare(unfused_reference(a, w), rounded)
+        self.assertTrue(np.any(rounded != expected))
 
     def test_serial_baseline_order_and_output_overwrite(self) -> None:
         calls = []
@@ -121,27 +87,28 @@ class TestBenchmark(unittest.TestCase):
         class Output:
             value = 99
 
-        output = Output()
+            def copy_(self, source):
+                calls.append("copy")
+                self.value = source[0]
 
-        def mm(a, w, dtype, *, out):
+        output = Output()
+        local = [0]
+
+        def mm(a, w, *, out):
             calls.append("mm")
-            self.assertEqual(dtype, "FP32")
-            out.value = a * w
+            out[0] = a * w
 
         def all_reduce(tensor, *, op, group, async_op):
             calls.append("all_reduce")
             self.assertEqual((op, group, async_op), ("SUM", "HCCL", False))
             tensor.value += 7
 
-        torch = SimpleNamespace(
-            float32="FP32",
-            ops=SimpleNamespace(aten=SimpleNamespace(mm=SimpleNamespace(dtype_out=mm))),
-        )
+        torch = SimpleNamespace(mm=mm)
         dist = SimpleNamespace(all_reduce=all_reduce, ReduceOp=SimpleNamespace(SUM="SUM"))
         for _ in range(2):
-            serial_step(2, 3, output, torch, dist, "HCCL")
+            serial_step(2, 3, local, output, torch, dist, "HCCL")
             self.assertEqual(output.value, 13)
-        self.assertEqual(calls, ["mm", "all_reduce"] * 2)
+        self.assertEqual(calls, ["mm", "copy", "all_reduce"] * 2)
 
 
 if __name__ == "__main__":

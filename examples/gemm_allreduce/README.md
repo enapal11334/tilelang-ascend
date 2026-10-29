@@ -80,20 +80,10 @@ PyTorch matmul。SHMEM 默认在该本机测试中关闭 TLS；所用端口由 u
 ## TP=2 串行基线与融合时延对比
 
 新增 `benchmark_gemm_allreduce.py` 和带 watchdog 的 `benchmark.sh`。
-基线完全不使用 TileLang：每卡显式调用
-`torch.ops.aten.mm.dtype_out(A_rank, W_rank.T, torch.float32, out=output_fp32)`，
-将整个本地 GEMM 的结果直接写入 FP32，再以 HCCL
-`all_reduce(SUM, async_op=False)` 得到完整输出。
-计算和通信通过当前流依赖串行执行，没有计算/通信重叠，也没有 FP16 局部输出或转换。
+基线完全不使用 TileLang：每卡用 `torch.mm(A_rank, W_rank.T)` 完成整个本地 GEMM，
+再将局部结果转为 FP32，最后以 HCCL `all_reduce(SUM, async_op=False)` 得到完整输出。
+计算、转换和通信通过当前流依赖串行执行，没有计算/通信重叠。
 两卡都保存完整结果，TP=2，`K_global = 2 * K_local`。
-
-需要支持 `aten.mm.dtype_out` 的匹配 PyTorch/torch_npu/CANN 环境。
-[Ascend 官方配置](https://raw.githubusercontent.com/Ascend/op-plugin/master/op_plugin/config/op_plugin_functions.yaml)
-从 v2.9 开始注册该 overload；[后端实现](https://raw.githubusercontent.com/Ascend/op-plugin/master/op_plugin/ops/opapi/MmKernelNpuOpApi.cpp)
-将指定的 FP32 输出直接传给 `aclnnMm`。旧版或目标设备不支持时直接失败，不回退。
-脚本在创建 HCCL group 前执行设备探针，检查 `1 + 2^-12` 和 `1 + 2^-12 - 1`
-的结果，以拒绝 FP16 累加舍入或 FP16 输出再转 FP32 的常见路径。
-探针不计时；其通过也不能证明所有输入下的内部累加行为。
 
 在上述 Linux 双卡环境准备完成后运行（额外需要 HCCL backend）：
 
@@ -120,14 +110,13 @@ JSON 保留每卡原始样本、shape、版本、设备、执行顺序及误差�
 需要纯设备 kernel 时延或重叠分析时，应另外使用 msprof 检查设备时间线；
 此处 E2E 数据不能代替设备 profiler 数据。
 
-**统一精度约定**：两者使用同一份 FP16 输入，要求 FP32 累加、局部输出、通信和最终输出。
-已删除局部 FP16 舍入 golden；两条路径均调用 `make_case` 返回的同一个 FP32 CPU golden，
-并通过同一个 `compare` 检查：atol=2^-16、rtol=2^-10、matched_ratio≥0.99，
-且 max_abs_error≤1e-2，非有限输出失败。测量前后均检查，任一卡失败则不输出加速比。
-JSON 为两条路径记录相同的误差字段和统一容差。
-GEMM 实现及通信库（HCCL/SHMEM）仍不同，加速比是完整实现的比较，不能单独归因于融合。
-当前环境没有双卡 NPU，尚无真实时延数据；910C 上该 CANN 路径的支持、内部累加精度和
-融合 kernel 正确性仍需目标版本源码及真机核验，不能据 CPU 检查判定通过。
+**精度及解释边界**：两者输入均为同一份 FP16，通信和最终输出均为 FP32。
+标准 `torch.mm` 的 FP16 输出先发生一次局部舍入，所以基线包含 FP16→FP32 转换，
+基线 golden 显式模拟「每卡 GEMM 后舍入 FP16，再用 FP32 SUM」。融合路径沿用原 FP32
+golden 和容差。JSON 同时报告基线相对原 FP32 golden 的最大绝对误差，非有限输出失败。
+两条路径的局部输出精度、GEMM 实现和通信库（HCCL/SHMEM）不同，测得的加速比是完整
+实现之间的比较，不能单独归因于融合，也不能视为完全相同数值路径的严格比较。
+当前环境没有双卡 NPU，尚无真实时延数据；原融合 kernel 仍需先在真机上验证。
 
 ## 接口与资源所有权
 
