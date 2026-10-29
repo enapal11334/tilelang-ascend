@@ -77,6 +77,58 @@ PyTorch matmul。SHMEM 默认在该本机测试中关闭 TLS；所用端口由 u
 `ACLSHMEM_MASTER_ADDR/PORT` 可按 bundled SHMEM 的环境约定设置。
 设备侧 wait 没有超时，保留 run.sh 的外部 watchdog；失败由 torchrun 终止 peer。
 
+## TP=2 串行基线与融合时延对比
+
+新增 `benchmark_gemm_allreduce.py` 和带 watchdog 的 `benchmark.sh`。
+基线完全不使用 TileLang：每卡显式调用
+`torch.ops.aten.mm.dtype_out(A_rank, W_rank.T, torch.float32, out=output_fp32)`，
+将整个本地 GEMM 的结果直接写入 FP32，再以 HCCL
+`all_reduce(SUM, async_op=False)` 得到完整输出。
+计算和通信通过当前流依赖串行执行，没有计算/通信重叠，也没有 FP16 局部输出或转换。
+两卡都保存完整结果，TP=2，`K_global = 2 * K_local`。
+
+需要支持 `aten.mm.dtype_out` 的匹配 PyTorch/torch_npu/CANN 环境。
+[Ascend 官方配置](https://raw.githubusercontent.com/Ascend/op-plugin/master/op_plugin/config/op_plugin_functions.yaml)
+从 v2.9 开始注册该 overload；[后端实现](https://raw.githubusercontent.com/Ascend/op-plugin/master/op_plugin/ops/opapi/MmKernelNpuOpApi.cpp)
+将指定的 FP32 输出直接传给 `aclnnMm`。旧版或目标设备不支持时直接失败，不回退。
+脚本在创建 HCCL group 前执行设备探针，检查 `1 + 2^-12` 和 `1 + 2^-12 - 1`
+的结果，以拒绝 FP16 累加舍入或 FP16 输出再转 FP32 的常见路径。
+探针不计时；其通过也不能证明所有输入下的内部累加行为。
+
+在上述 Linux 双卡环境准备完成后运行（额外需要 HCCL backend）：
+
+```bash
+# 同输入、同 shape 比较两条路径，输出 mean/p50/p95 和 mean 加速比。
+ASCEND_RT_VISIBLE_DEVICES=0,1 bash examples/gemm_allreduce/benchmark.sh \
+    --m 96 --n 192 --k-local 128 --warmup 20 --iterations 100 \
+    --output benchmark_results/tp2.json
+
+# 单独运行非 TileLang 基线；仅需 PyTorch、torch_npu、NumPy、Gloo 和 HCCL。
+ASCEND_RT_VISIBLE_DEVICES=0,1 bash examples/gemm_allreduce/benchmark.sh --impl unfused
+# 单独测融合路径（不创建 HCCL group）。
+ASCEND_RT_VISIBLE_DEVICES=0,1 bash examples/gemm_allreduce/benchmark.sh --impl fused
+```
+
+计时范围为**同步后的完整调用 host E2E 时延**：从 host 发起调用到设备全部完成，
+包括 Python dispatch 和末尾设备同步。每轮 Gloo barrier 在计时外；初始化、编译、
+分配、H2D/D2H、预热和精度检查均不计入。两条路径先通过精度检查才开始测量，
+正式测量后再次校验。每轮取两 rank 时延的最大值，再计算 mean/p50/p95；
+`speedup_mean = unfused_mean_ms / fused_mean_ms`，大于 1 表示本次融合路径更快。
+JSON 保留每卡原始样本、shape、版本、设备、执行顺序及误差，只有 rank 0 写文件。
+两 rank 均执行精度校验；JSON 的误差数值来自 rank 0。
+默认先测 unfused 后测 fused；可单独运行两种模式并调换顺序，检查热状态影响。
+需要纯设备 kernel 时延或重叠分析时，应另外使用 msprof 检查设备时间线；
+此处 E2E 数据不能代替设备 profiler 数据。
+
+**统一精度约定**：两者使用同一份 FP16 输入，要求 FP32 累加、局部输出、通信和最终输出。
+已删除局部 FP16 舍入 golden；两条路径均调用 `make_case` 返回的同一个 FP32 CPU golden，
+并通过同一个 `compare` 检查：atol=2^-16、rtol=2^-10、matched_ratio≥0.99，
+且 max_abs_error≤1e-2，非有限输出失败。测量前后均检查，任一卡失败则不输出加速比。
+JSON 为两条路径记录相同的误差字段和统一容差。
+GEMM 实现及通信库（HCCL/SHMEM）仍不同，加速比是完整实现的比较，不能单独归因于融合。
+当前环境没有双卡 NPU，尚无真实时延数据；910C 上该 CANN 路径的支持、内部累加精度和
+融合 kernel 正确性仍需目标版本源码及真机核验，不能据 CPU 检查判定通过。
+
 ## 接口与资源所有权
 
 `build_gemm_allreduce(M,N,K_local,rank)` 返回低层 callable：
