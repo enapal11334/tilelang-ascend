@@ -1069,7 +1069,7 @@ def binary_op(
 
     size_0 = math.prod(dst_extent)
     size_1 = math.prod(src0_extent)
-    assert size_0 == size_1, "size must be same"
+    assert arith.Analyzer().can_prove_equal(size_0, size_1), "size must be same"
     if isinstance(src1, BufferLoad):
         buffer_1 = src1.buffer
         indices_1 = src1.indices
@@ -1089,7 +1089,7 @@ def binary_op(
         _validate_binary_op_region(src1, op, "src1")
         src1_ptr, src1_extent = _handle_buffer_region(src1, "r")
         size_2 = math.prod(src1_extent)
-        assert size_0 == size_2, "size must be same"
+        assert arith.Analyzer().can_prove_equal(size_0, size_2), "size must be same"
 
         return T.call_intrin(
             "handle",

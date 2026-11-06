@@ -40,3 +40,12 @@ the same owner. Otherwise, supply an explicit scope for the barrier.
 Automatic scope placement does not enable the other three options. In particular,
 placing a producer and consumer on the correct units does not synchronize them;
 their data dependencies still need automatic or explicit synchronization.
+
+## SHMEM completion
+
+`T.shmem_quiet()` completes prior NPU SHMEM operations on the calling Vector
+core and lowers to `aclshmem_quiet()`. On an HCCS-only system, completed updates
+are globally visible. It belongs to `T.Scope("V")` (or automatic Vector
+placement); Cube placement is rejected. This is stronger than a local
+`T.barrier_all()`, but it is neither a cross-rank barrier nor a replacement for
+waiting for a Cube/FIX producer before publishing its data.

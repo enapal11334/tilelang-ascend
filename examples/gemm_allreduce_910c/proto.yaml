@@ -1,0 +1,69 @@
+# Derived from design.md: dtypes from section 9.3, attrs from section 4.7.
+# Design specification only; kernel/context and T.shmem_quiet are not implemented here.
+operator:
+  name: gemm_allreduce_910c
+  category: Fusion
+  formula: |
+    X_r = GEMM_FP32(A_r[M,K_local], B_r[K_local,N])
+    Y_r = cast_input_dtype(X_0 + X_1 + ... + X_(world_size-1))
+    FP32 SUM follows ascending global rank order; all ranks receive Y[M,N].
+  attrs:
+    - name: world_size
+      type: Int
+      default: null
+      required: true
+      description: "§1，2/4/8"
+    - name: rank
+      type: Int
+      default: null
+      required: true
+      description: "§1，0<=rank<world_size"
+    - name: cube_groups
+      type: Int
+      default: null
+      required: true
+      description: "§5，必须等于共同 metadata 计算的 G"
+    - name: block_m
+      type: Int
+      default: 16
+      required: false
+      description: "§5，首版固定值"
+    - name: block_n
+      type: Int
+      default: 128
+      required: false
+      description: "§5，首版固定值"
+    - name: block_k
+      type: Int
+      default: 128
+      required: false
+      description: "§5，首版固定值"
+    - name: pipeline_slots
+      type: Int
+      default: 2
+      required: false
+      description: "§6，正式路径固定2；1仅用于串行诊断基线"
+    - name: algorithm
+      type: Enum
+      default: "all_peer_pull"
+      required: false
+      description: "§1，首版唯一通信算法"
+    - name: reduction
+      type: Enum
+      default: "sum"
+      required: false
+      description: "§1，固定 SUM"
+    - name: protocol_version
+      type: Int
+      default: 1
+      required: false
+      description: "§7，所有 rank 一致"
+  inputs:
+    - name: A
+      dtype: [float16, bfloat16]
+    - name: B
+      dtype: [float16, bfloat16]
+  outputs:
+    - name: Y
+      dtype: [float16, bfloat16]
+  schema: "gemm_allreduce_910c(Tensor A, Tensor B, GemmAllReduce910CContext comm) -> Tensor Y"

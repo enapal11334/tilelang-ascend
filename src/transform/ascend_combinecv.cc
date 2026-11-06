@@ -801,6 +801,7 @@ AscendResource ResourceForCall(const CallNode *call, std::string *operation) {
     return AscendResource::kExplicit;
   }
   if (call->op.same_as(ascend_set_deq_scale()) ||
+      call->op.same_as(ascend_shmem_quiet()) ||
       IsVectorMaskSetter(call_ref) || IsSelectedVectorTerminal(call_ref)) {
     return AscendResource::kVector;
   }

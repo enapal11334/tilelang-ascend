@@ -415,6 +415,15 @@ def shmem_ub_get_nbi(dst: Buffer, src: Buffer, nelems: PrimExpr, newPe: PrimExpr
     )
 
 
+def shmem_quiet() -> tir.Call:
+    """Complete prior NPU SHMEM operations on the calling Vector core.
+
+    Calls ``aclshmem_quiet()``; on an HCCS-only system, completed updates are
+    globally visible. This is not a cross-rank barrier or a Cube/FIX handoff.
+    """
+    return tir.call_intrin("handle", tir.op.Op.get("tl.ascend_shmem_quiet"))
+
+
 def gemm_v0(A, B, C, transpose_A=False, transpose_B=False, init=False, kL0Size=128, n_actual=None):
     """
     Performs a block-level General Matrix Multiplication (GEMM).

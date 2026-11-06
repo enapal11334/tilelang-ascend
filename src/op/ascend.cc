@@ -1215,6 +1215,11 @@ TIR_DEFINE_TL_BUILTIN(ascend_shmem_ub_get_nbi)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(ascend_shmem_quiet)
+    .set_num_inputs(0)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(ascend_gather_mask)
     .set_num_inputs(4)
     .set_attr<TCallEffectKind>("TCallEffectKind",

@@ -571,6 +571,10 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     ShmemCodegen(op);
   } else if (op->op.same_as(tl::ascend_shmem_ub_put_nbi())) {
     ShmemCodegen(op);
+  } else if (op->op.same_as(tl::ascend_shmem_quiet())) {
+    ICHECK(current_resource_scope_ == 1)
+        << "SHMEM quiet must be inside T.Scope(\"V\")";
+    PrintOpCall(op, "aclshmem_quiet", {0, 0}, {0, 0});
   } else if (op->op.same_as(tl::ascend_row_expand_mul())) {
     RowExpandMulCodegen(op);
   } else if (op->op.same_as(tl::ascend_wait_cross_flag())) {

@@ -311,6 +311,7 @@ bool CallMayAffectVectorMask(const Call &call) {
     return true;
   }
   if (call->op.same_as(ascend_datacachecleanandinvalid_experiment()) ||
+      call->op.same_as(ascend_shmem_quiet()) ||
       call->op.same_as(ascend_pipe_barrier()) ||
       call->op.same_as(ascend_sync_all()) ||
       call->op.same_as(ascend_set_flag()) ||
