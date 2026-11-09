@@ -160,6 +160,22 @@ def precision_cases(shapes, boundary=False):
                             time.sleep(0.01)
                         output = comm(a, b)
                         comm.stream.synchronize()
+                        if (
+                            comm.world_size == 4
+                            and shape == (16, 256, 128)
+                            and dtype == torch.float16
+                            and case == "ones"
+                            and repeat == 2
+                        ):
+                            output = output.cpu()
+                            p = comm.partial.cpu()[0]
+                            print(
+                                f"[TILE_DEBUG] rank={comm.rank} "
+                                f"Y0={output[:, :BN].unique().tolist()} "
+                                f"Y1={output[:, BN:].unique().tolist()} "
+                                f"P0={p[0].unique().tolist()} P1={p[1].unique().tolist()}",
+                                flush=True,
+                            )
                         check(output, expected * sign, f"{shape} {dtype} {case} {repeat}", boundary)
 
 
