@@ -16,7 +16,7 @@ import torch_npu  # noqa: F401
 
 import tilelang
 from comm import GemmAllReduce910CContext, finalize_shmem
-from gemm_allreduce_910c import BN, BK, gemm_allreduce_910c
+from gemm_allreduce_910c import BK, BM, BN, gemm_allreduce_910c
 
 L0 = ((16, 256, 128), (32, 512, 256))
 L1 = ((16, 128, 128), (1, 67, 65), (3, 67, 65), (17, 129, 17), (33, 257, 129))
@@ -88,7 +88,11 @@ def check_source(kernel, dtype):
         assert name in source, f"Missing generated {name}"
     assert ("bfloat16_t" if dtype == torch.bfloat16 else "half") in source
     copies = re.findall(r"copy_gm_to_l1<[^;]+;", source)
-    assert len(copies) >= 4
+    # A single K panel needs no prefetch. Check both panel shapes regardless of how
+    # many copy sites survive lowering.
+    for operand, rows, cols in (("A", BM, BK), ("B", BK, BN)):
+        panel = rf"copy_gm_to_l1<[^,]+,\s*{rows}\s*,\s*{cols}\s*>"
+        assert any(re.match(panel, call) for call in copies), f"Missing L1 copy for {operand}"
     assert all(re.search(r",\s*true\s*\);$", call) for call in copies), "L1 tail clear missing"
 
 

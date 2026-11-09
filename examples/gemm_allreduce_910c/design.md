@@ -353,8 +353,9 @@ result: pass (design coverage; hardware correctness unverified)
 `common.h:56-105` 的 GM→L1 helper 支持真实 pitch、valid 行列和 NZ fractal 清零；
 `pad_value=0` 不能泛指此 L1 路径，它在另一条 GM→UB 路径使用。
 两个 L1 版本必须是独立逻辑 buffer，并从各自逻辑 offset=0 完整写入，避免非零子切片
-被 `need_clear=false` 判定后遗漏尾部清零；生成代码须检查全部四种 A/B 版本调用的
-`need_clear=true`、地址不重叠和完整 fractal 容量。若编译器合并或改写 allocation，
+被 `need_clear=false` 判定后遗漏尾部清零。生成代码须包含 A、B 两类 GM→L1 搬运，
+并对每条实际生成的调用检查 `need_clear=true`、地址不重叠和完整 fractal 容量。
+单个 K tile 的预取分支可被消除。若编译器合并或改写 allocation，
 必须重新证明这些条件，不能仅凭 Python 中声明了四个变量视为保证。
 
 L0C 可完整写入私有物理 partial tile；SHMEM 与本地读只消费前 `valid_m*BN` 个 FP32 元素。
