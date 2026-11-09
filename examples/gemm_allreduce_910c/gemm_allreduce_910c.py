@@ -100,6 +100,27 @@ def gemm_allreduce_910c(
             T.shmem_ub_get_nbi(dst, peer_tile, valid_m * BN, peer)
         T.set_flag("MTE2", "V", 0)
         T.wait_flag("MTE2", "V", 0)
+        # L0 ones repeat 2, tile 0, before adding this rank's contribution.
+        if (
+            world_size == 4
+            and M == 16
+            and N == 256
+            and K == 128
+            and dtype == "float16"
+            and (rank == 0 or rank == 3)
+            and gid == 0
+            and slot == 0
+            and seq == 11
+        ):
+            T.set_flag("MTE2", "S", 0)
+            T.wait_flag("MTE2", "S", 0)
+            T.printf(
+                "[READ_DEBUG] recv=%d peer=%d seq=%d value=%f\n",
+                rank,
+                peer,
+                seq,
+                dst[0, 0],
+            )
 
     @T.prim_func
     def main(
