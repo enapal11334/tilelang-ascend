@@ -78,13 +78,14 @@ def golden(shape, dtype, world_size, case):
 
 def check_source(kernel, dtype):
     source = kernel.get_kernel_source()
-    assert source.count("aclshmem_quiet();") == 3
-    for name in (
-        "shmem_ub_get_nbi<float>",
-        "shmem_ub_put_nbi<int>",
-        "copy_l1_to_l0a",
-        "copy_l1_to_l0b",
-    ):
+    phases = source.split("aclshmem_quiet();")
+    assert len(phases) == 4, "Expected three quiet calls per tile"
+    payload_put, control_put = "shmem_ub_put_nbi<float>", "shmem_ub_put_nbi<int>"
+    assert payload_put in phases[0] and control_put not in phases[0], "Publish tile before READY"
+    assert all(payload_put not in phase for phase in phases[1:]), "Tile PUT after payload quiet"
+    assert control_put in phases[1] and control_put in phases[2], "Missing READY or ACK PUT"
+    assert "shmem_ub_get_nbi" not in source, "Reduce from the local inbox"
+    for name in ("copy_l1_to_l0a", "copy_l1_to_l0b"):
         assert name in source, f"Missing generated {name}"
     assert ("bfloat16_t" if dtype == torch.bfloat16 else "half") in source
     copies = re.findall(r"copy_gm_to_l1<[^;]+;", source)
@@ -160,22 +161,6 @@ def precision_cases(shapes, boundary=False):
                             time.sleep(0.01)
                         output = comm(a, b)
                         comm.stream.synchronize()
-                        if (
-                            comm.world_size == 4
-                            and shape == (16, 256, 128)
-                            and dtype == torch.float16
-                            and case == "ones"
-                            and repeat == 2
-                        ):
-                            output = output.cpu()
-                            p = comm.partial.cpu()[0]
-                            print(
-                                f"[TILE_DEBUG] rank={comm.rank} "
-                                f"Y0={output[:, :BN].unique().tolist()} "
-                                f"Y1={output[:, BN:].unique().tolist()} "
-                                f"P0={p[0].unique().tolist()} P1={p[1].unique().tolist()}",
-                                flush=True,
-                            )
                         check(output, expected * sign, f"{shape} {dtype} {case} {repeat}", boundary)
 
 
@@ -280,7 +265,7 @@ def serial_call(comm, kernel, a, b):
     output = torch.empty((m, n), dtype=comm.dtype, device=comm.device)
     seq = comm.seq_base
     comm.seq_base += comm.rounds
-    kernel(a, b, comm.partial, comm.flags, output, seq, stream=comm.stream.npu_stream)
+    kernel(a, b, comm.inbox, comm.flags, output, seq, stream=comm.stream.npu_stream)
     return output
 
 

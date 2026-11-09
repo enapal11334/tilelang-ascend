@@ -1,5 +1,16 @@
 # 验证记录
 
+## 2026-11-09 · All-peer PUT
+
+- 4 个示例 Python 文件通过语法检查。按源码中的表达式核对 2/4/8 rank 的两槽 inbox
+  与 READY/ACK 偏移、边界和对齐，确认有效行 PUT 不越过发送 rank 对应的 tile。
+- 用合成生成代码验证 `check_source()`，覆盖 FP16/BF16 的单 K 块，能拒绝错误的
+  PUT/quiet 顺序及遗留 GET。
+- Windows 上尝试启动 L0，在 `import torch` 处退出。PUT 版本的 CANN 编译、四卡 L0
+  和 4096 代协议压力测试待在 910C 上执行。
+
+## 2026-11-05 · 初版 Pull
+
 记录日期：2026-11-05。当前机器为Windows，无torch/torch_npu、TVM运行库、CANN或NPU。
 以下严格区分本地检查与设备验收；不把静态检查当作DSL lowering或NPU通过。
 

@@ -48,10 +48,10 @@ Y_r=\operatorname{cast}_{D}\left(X_0+X_1+\cdots+X_{P-1}\right).
 优先小 M 的 decode 延迟。目标是完整输出 tile 就绪后立即通信，与后续 tile GEMM 重叠，
 而不是对每个 K chunk 单独 AllReduce，也不是等待整张 GEMM 完成后才开始通信。
 
-首版选择 **all-peer pull**：每卡读取其余卡的局部结果并本地求和，省去 owner 归约后
-再次传播结果的协议阶段。已接受其在 P=2/4/8 时，相对按相同 padded payload 计算的
-带宽最优 ReduceScatter+AllGather 分别有 1/2/4 倍全机数据量。首版不声称 8 rank
-具有带宽扩展优势；owner/ring 算法属于后续独立优化。
+采用 **all-peer push**。每卡向其他卡发送本地结果，再从本卡 inbox 读取各 rank 的结果并求和。
+四卡测试中，原 pull 协议在 READY 为新世代时仍可能读到上一代 tile。push 将 payload 纳入
+SHMEM quiet 的完成范围后再发布 READY。P=2/4/8 时，相对相同 padded payload 的带宽最优
+ReduceScatter+AllGather，全机远端数据量分别为 1/2/4 倍。
 
 验收同时要求正确性、时间线上的真实重叠以及关键小 M case 的实测端到端收益。
 tile 太少或 GEMM 太短时，通信可能只被部分隐藏；Q=1 不存在后续 tile 可重叠。
@@ -59,13 +59,9 @@ tile 太少或 GEMM 太短时，通信可能只被部分隐藏；Q=1 不存在�
 ### 1.5 数据流
 
 ```text
-rank r: A_r/B_r → L1 → L0A/L0B → FP32 L0C → 对称 GM partial[g,slot]
-                                                │ FIX 完成、本地 READY
-                                                ▼
-        peers 的对称 partial ── SHMEM GET ──→ FP32 UB 顺序求和
-                                                │ 最终一次 cast
-                                                ▼
-                                          普通 GM Y_r[M,N]
+rank r: A_r/B_r → L1 → L0A/L0B → FP32 L0C → 本卡 inbox[g,slot,r]
+        本卡 inbox[g,slot,r] → UB → SHMEM PUT → 各 peer 的 inbox[g,slot,r]
+        本卡 inbox[g,slot,:] → UB 按 rank 顺序 FP32 SUM → cast → Y_r[M,N]
 
 Cube:   [GEMM tile j] [GEMM tile j+1] [等待/继续下一 tile]
 Vector:               [通信/求和 j] [通信/求和 j+1]
@@ -111,15 +107,12 @@ pass_configs = {
 | Cube 计算 | `T.mma(a_l0,b_l0,acc_l0c,init=(k==0))` | `examples/gemm/example_gemm_intrinsic.py:94` |
 | 核内依赖 | `T.set_flag(src_pipe,dst_pipe,event)` / `T.wait_flag(...)` | 同上及 `tilelang/language/ascend.py` |
 | 本地 C/V 交接 | `T.set_cross_flag(pipe,id)` / `T.wait_cross_flag(id)` | `examples/gemm_allreduce/gemm_allreduce.py` |
-| 远端连续读 | `T.shmem_ub_get_nbi(dst_ub,src_gm,nelems,pe)` | `examples/shmem/shmem_mm_test_ub_get_nbi.py` |
-| READY/ACK 发布 | `T.shmem_ub_put_nbi(src_ub,dst_gm,nelems,pe,offset)` | `examples/shmem/shmem_mm_test_ub_put_nbi.py` |
-| 带偏移对称视图 | `T.decl_buffer(...,data=partial.data,elem_offset=...)` | 现有 GEMM+AllReduce 原型；须补生成代码回归 |
+| tile 与 READY/ACK 发布 | `T.shmem_ub_put_nbi(src_ub,dst_gm,nelems,pe,offset)` | `examples/shmem/shmem_mm_test_ub_put_nbi.py` |
 | FP32 求和 | `T.tile.add(acc_ub[0:valid_m,:],acc_ub[0:valid_m,:],incoming_ub[0:valid_m,:])` | `tilelang/language/ascend_tile.py` 的连续 BufferRegion 支持 |
 | 最终转换 | `T.tile.cast(out_ub,acc_ub,"CAST_RINT",count=valid_m*BN)` | `examples/deepseek_v4/int8_gemm.py` |
 
 SHMEM 的 `nelems` 和 `offset` 按接口要求使用元素数，不能混用字节数。
-当前 UB GET/PUT 的底层为 `aclshmem_ptr` 远端地址解析及 `DataCopyPad`，属于 MTE 直访远端 GM，
-不将其描述成已经实现的 RDMA/SDMA 通信路径。
+UB PUT 通过 `aclshmem_ptr` 解析远端地址，再由 MTE 的 `DataCopyPad` 写入远端 GM。
 
 ### 3.2 实现前置扩展：`T.shmem_quiet()`
 
@@ -156,7 +149,7 @@ for each resident group g in parallel:
                     valid_k=min(BK,K_local-k*BK)
                     load valid A/B into zero-padded L1 version k%2
                     transfer L1→L0A/B; mma(init=(k==0))
-                wait M→FIX; copy full physical L0C tile to partial[g,slot]
+                wait M→FIX; copy full physical L0C tile to inbox[g,slot,rank]
                 publish local READY[slot] only after FIX completion
         drain both FREE tokens and K-pipeline events
     Vector (both AIVs):
@@ -202,11 +195,11 @@ for each resident group g in parallel:
 
 | buffer | shape / dtype | 大小 | ownership |
 |---|---|---|---|
-| partial | `[G,2,16,128]` FP32 | 16384G B | 本 rank Cube 写；本地及所有远端读者消费 |
+| inbox | `[G,2,P,16,128]` FP32 | 16384GP B | 本 rank Cube 写自己的 lane，其他 lane 各由对应的发送 rank PUT |
 | flags | `[G,2,2,P,16]` int32 | 256GP B | kind=READY/ACK；每源 rank 独占 64B 行 |
 | Y | `[M,N]` FP16/BF16 | 2MN B | 每个有效输出 tile 仅本 rank 对应 group 写 |
 
-partial 与 flags 在各 rank 上按相同顺序、大小、对齐分配。每行控制数据 64B 对齐，
+inbox 与 flags 在各 rank 上按相同顺序分配，总计 16640GP B。每行控制数据 64B 对齐，
 不得让不同发送者共享或覆盖同一控制行；自身 rank 对应行保留但不轮询。
 flags 仅在新 context 中用 TileLang 初始化 kernel 清零，完成后才能开始首次调用；
 不在热路径用 `torch.zeros/fill_` 重置状态，不在复用时回零序号。
@@ -235,8 +228,9 @@ L1/L0/UB 容量与编译器实际保留空间。使用 `T.annotate_address` 在�
 ### 4.4 完整搬运路径
 
 ```text
-GM A/B → L1 A/B → L0A/L0B → T.mma → L0C → FIX → 对称 GM partial
-本地/远端 partial → MTE2 → acc/incoming UB → FP32 add → cast → out UB
+GM A/B → L1 A/B → L0A/L0B → T.mma → L0C → FIX → 本卡 inbox 的自身 lane
+自身 lane → MTE2 → incoming UB → MTE3 SHMEM PUT → 各 peer 的对应 lane
+本卡 inbox → MTE2 → acc/incoming UB → FP32 add → cast → out UB
 out UB → MTE3 → 普通 GM Y
 seq UB → SHMEM PUT/MTE3 → peer flags；本地 flags → MTE2 → poll UB → scalar 比较
 ```
@@ -257,7 +251,7 @@ finalize_shmem()
 
 `GemmAllReduce910CContext` 位于 `comm.py`，从 A/B 推导固定的 M/N/K_local/dtype/P/G、
 逻辑设备和 stream，持有对称 workspace、JIT callable 和 invocation counter。
-原始 callable 显式接收 `(A,B,partial,flags,Y,seq_base)`，`out_idx=[]`，不设 `workspace_idx`：
+原始 callable 显式接收 `(A,B,inbox,flags,Y,seq_base)`，`out_idx=[]`，不设 `workspace_idx`：
 对称 workspace 由 context 提供，不能让普通 JIT workspace 分配器代为分配普通 GM。
 
 setup 流程：调用方设置本地设备并初始化 Gloo → 查询各 rank 当前设备的 Cube 数、核对
@@ -313,9 +307,9 @@ M/N/K_local 从输入 shape 推导；seq_base 属于调用状态，不是可任�
 | block_n | Int | 128 | false | §5，首版固定值 |
 | block_k | Int | 128 | false | §5，首版固定值 |
 | pipeline_slots | Int | 2 | false | §6，正式路径固定2；1仅用于串行诊断基线 |
-| algorithm | Enum | all_peer_pull | false | §1，首版唯一通信算法 |
+| algorithm | Enum | all_peer_push | false | §1，固定通信算法 |
 | reduction | Enum | sum | false | §1，固定 SUM |
-| protocol_version | Int | 1 | false | §7，所有 rank 一致 |
+| protocol_version | Int | 2 | false | §7，所有 rank 一致 |
 
 ## 5. Tiling 策略
 
@@ -358,7 +352,7 @@ result: pass (design coverage; hardware correctness unverified)
 单个 K tile 的预取分支可被消除。若编译器合并或改写 allocation，
 必须重新证明这些条件，不能仅凭 Python 中声明了四个变量视为保证。
 
-L0C 可完整写入私有物理 partial tile；SHMEM 与本地读只消费前 `valid_m*BN` 个 FP32 元素。
+L0C 完整写入 inbox 的自身 lane。SHMEM PUT 与本地读只消费前 `valid_m*BN` 个 FP32 元素。
 N 尾保留每行 BN=128 的物理 pitch，未使用列不写入最终输出。
 `T.tile.add` 无 count 参数，三个操作数必须显式使用 `[0:valid_m,:]` 整行前缀，
 保持连续并避免读取未搬入的 UB 行；不能只在文字上宣称整 buffer 调用自动忽略无效行，
@@ -383,9 +377,9 @@ cast 处理有效行前缀；`out_ub` 仍为 `[16,128]`，通过
 |---|---|
 | GM→L1 输入 | 2QL 次二维 copy；有效字节 `2K_local*(NT*M+MT*N)` |
 | L1→L0 | 2QL 次；固定物理 tile，K 尾补零 |
-| L0C→partial | Q 次，8192Q B（完整物理 tile） |
-| 本地 partial→UB | Q 次，4S B |
-| peer partial GET | (P−1)Q 次，4S(P−1) B |
+| L0C→本卡 inbox | Q 次，8192Q B（完整物理 tile） |
+| 本卡 inbox→UB | (P+1)Q 次，4S(P+1) B，含发送暂存和归约读入 |
+| tile PUT | (P−1)Q 次，4S(P−1) B |
 | 最终 UB→Y | Q 次，2MN B |
 | READY/ACK PUT | 2(P−1)Q 次，共 128(P−1)Q B |
 | 状态轮询 | 每轮 64B DMA；次数依 rank skew，须测量，不能假定为1 |
@@ -397,13 +391,13 @@ G 个 Cube 与 G 个 AIV0 active，各组串行 tile 数为 floor/ceil(Q/G)。
 
 下表使用 P=8；MiB=2^20 B。与 dtype 无关的通信均为 FP32，两种输入 dtype 都需测。
 
-| (M,N,K_local) | Q / L | 输入 copy 数 / 平均有效字节 | 输入总量 | peer GET 数 / 平均字节 | peer 数据总量 | 控制 PUT 总量 |
+| (M,N,K_local) | Q / L | 输入 copy 数 / 平均有效字节 | 输入总量 | tile PUT 数 / 平均字节 | peer 数据总量 | 控制 PUT 总量 |
 |---|---|---|---|---|---|---|
 | (1,8192,4096) | 64 / 32 | 4096 / 16512 B | 64 MiB + 512 KiB | 448 / 512 B | 224 KiB | 56 KiB |
 | (8,4096,1024) | 32 / 8 | 512 / 17408 B | 8 MiB + 512 KiB | 224 / 4096 B | 896 KiB | 28 KiB |
 
 例如共同 H=24 时，上述两例 G 分别为24和16，每组处理2–3或2个 tile；H=24仅为计算示例，
-不是对910C核数的断言。M=1 仍有大量512B GET和64B控制消息，属于明确的延迟风险。
+不是对910C核数的断言。M=1 仍有大量 512B tile PUT 和 64B 控制消息，属于明确的延迟风险。
 
 全机远端数据为 `4S*P*(P−1)`，带宽最优 RS+AG 按同一 padded payload 为 `8S*(P−1)`，
 两者比值 P/2。N 很小时仍传物理128列，这部分浪费不靠 host padding 隐藏。
@@ -411,10 +405,10 @@ G 个 Cube 与 G 个 AIV0 active，各组串行 tile 数为 floor/ceil(Q/G)。
 ```text
 [REORDER-COST]
 path: shared FP16/BF16 Expert tile path; no standalone reorder kernel
-gm_passes: tiled GEMM input rereads as above; one partial store/local read,
-           P-1 peer reads and one output store; no full-input staging pass
-dma_transactions: logical 2QL input copies + 2QL L1/L0 copies + (P+2)Q
-                  partial/read/output copies + 2(P-1)Q control PUTs + polls
+gm_passes: per tile one FIX store, one staging read, P-1 remote tile PUTs,
+           P local inbox reads and one output store
+dma_transactions: logical 2QL input copies + 2QL L1/L0 copies + (P+3)Q
+                  local copies + 3(P-1)Q payload/control PUTs + polls
 average_dma_bytes: per-class values/formulas above; polls are 64 B
 gm_scalar_accesses: 0 for tensor data and mutable flags
 address_div_mod_per_element: 0; tile decode once per task
@@ -435,7 +429,7 @@ result: analytical cost recorded; device feasibility/performance gate NOT RUN
 3. MTE1 等待 L1 ready 与 L0 free，完成两次 L1→L0 copy，归还该 L1 free，置 MTE1→M ready。
 4. M 等待 L0 ready；首个 chunk 还需等待上个 tile 的 FIX→M，执行 init=True 的 mma。
    之后每个 chunk init=False；M 完成后归还 L0 free。
-5. 所有 K 完成后 M→FIX，FIX 写 partial，产生 FIX→M 与本地 cross READY。
+5. 所有 K 完成后 M→FIX，FIX 写 inbox 的自身 lane，产生 FIX→M 与本地 cross READY。
 
 事件版本使用 K chunk 的 `k%2`，不能将每个 tile 重置的内层 `kk%2` 错当全程流水版本。
 相同 pipe-pair 的事件按版本区分，MTE1 在读取 A/B 两者完成之后才返还 L1 free。
@@ -467,25 +461,23 @@ Cube 退出时等待两个 FREE，将未使用槽位的初始 token 也消费干
 
 ## 7. 同步策略
 
-### 7.1 READY/GET/ACK 协议
+### 7.1 PUT/READY/ACK 协议
 
 每个有效 tile 由 AIV0 执行以下固定顺序；slot=j%2，seq 为 §6.3 的值：
 
-1. 等待 Cube 的本地 READY。该 READY 由 FIX 完成触发，不能提前到仅 enqueue partial 写回。
-2. **quiet #1：发布前 release。** Cube FIX 完成及 C/V 交接是前提，V quiet 不代替它们。
+1. 等待 Cube 的本地 READY，再将本卡 inbox 的自身 lane 搬到 incoming UB。
+2. 通过 MTE2→MTE3 确认暂存完成，再向所有 peers 的 `inbox[g,slot,self_rank]` PUT tile。
+   **quiet #1：完成全部 tile PUT。** 此后可以发布 READY 并复用 incoming UB。
 3. 在 seq UB 填入当前 seq，完成 V→MTE3；向所有 peers 的
    `flags[g,slot,READY,self_rank,:]` PUT 同一个64B控制行。
-4. **quiet #2：完成全部 READY PUT。** 发布前 quiet 不能省略成只有发布后 quiet，
-   因为 peer 可能已经观察到 READY；控制 UB 在此完成之前保持不可变。
-5. 对 p=0…P−1：p=self 时从本地 partial DMA；否则轮询本地
-   `flags[g,slot,READY,p,0]==seq` 后 GET p 的对应 partial。
+4. **quiet #2：完成全部 READY PUT。** 控制 UB 保持到 PUT 完成。
+5. 对 p=0…P−1，若 p≠self 则先等待本地 `flags[g,slot,READY,p,0]==seq`，
+   然后从本卡 `inbox[g,slot,p]` DMA 读入。
    p=0 的数据直接初始化 acc UB，其后逐项 FP32 add，禁止改变全局加法顺序。
 6. 每次 MTE2→V 完成后才读取/求和；复用 incoming UB 前确认前一向量读取完成（V→MTE2）。
    add 的三个操作数显式使用 `[0:valid_m,:]`，cast 指定 `count=valid_m*BN`，
    经 V→MTE3 写有效 Y 区域并确认输出完成。
-7. 全部 GET 完成后，向所有源 ranks 的 `flags[g,slot,ACK,self_rank,:]` PUT seq。
-   ACK 前明确完成 GET→归约→V→MTE3→输出完成的链；不能把 GET 函数返回或仅 MTE2→V wait
-   当成 ACK 所在 MTE3 已被正确排序。若重排为提前 ACK，必须另证 MTE2→MTE3 依赖，本版不做。
+7. 完成 inbox 读取、归约及 Y 写出后，向所有源 rank 的 `flags[g,slot,ACK,self_rank,:]` PUT seq。
 8. **quiet #3：完成全部 ACK PUT。** 再轮询本地全部 reader 的 `ACK==seq`。
 9. 全部读者 ACK 收齐后，AIV0 返还本地 FREE；AIV1 完成相同握手，Cube 才可覆写该槽。
 
@@ -500,9 +492,8 @@ poll UB 再次被 DMA 覆写前，先完成前一次 scalar 读取；可使用�
 禁止直接 `while flags[...]` 做可缓存的 GM scalar 轮询。
 
 DMA 避免 mutable GM scalar DCache 轮询问题，但 SHMEM 的 L2 参数并不等于禁用所有 cache。
-当前 GET/PUT 为异步发出；quiet 与 pipe event 的具体完成性，以及 FIX→READY→GET 的
-跨核可见性需由 §9.2 的 payload/epoch 压力门禁验证。失败时先诊断接口或顺序，
-不得通过加 host barrier、每 tile 全卡 barrier 或忽略旧数据来宣布通过。
+PUT 异步发出。FIX→本地 DMA 和 PUT→quiet→READY→本卡 inbox 读取的可见性需由 §9.2
+的 payload/epoch 压力门禁验证。若失败，先用独立的 SHMEM PUT→quiet→READY 测试复现。
 
 ## 8. CV 融合设计
 
@@ -511,15 +502,15 @@ DMA 避免 mutable GM scalar DCache 轮询问题，但 SHMEM 的 L2 参数并不
 
 | 执行侧 | 输入 ownership | 工作 | 释放条件 |
 |---|---|---|---|
-| Cube | 收到 FREE 的 partial 槽 | 完整 K 累加，FIX 写回 | FIX 完成后交给 V/peers |
-| AIV0 | READY 指定世代的各 rank partial | 发布、GET、FP32 SUM、cast、写 Y、ACK | 全部 readers ACK 后返还 FREE |
+| Cube | 收到 FREE 的自身 inbox lane | 完整 K 累加，FIX 写回 | FIX 完成后交给 AIV0 |
+| AIV0 | READY 指定世代的各 rank inbox lane | PUT 发布、本地读、FP32 SUM、cast、写 Y、ACK | 全部 readers ACK 后返还 FREE |
 | AIV1 | 本地 cross flag 参与者 | 初始化、等待、返还 token | 每次 valid tile 配平 |
 
-partial 生命周期为 FREE→Cube 写→FIX 完成→远端可读→全部 reader 读完→FREE。
-ACK 只说明读者已不再依赖源槽，不依赖跨 stream host 同步；输出写完是本版 ACK 的保守前提。
+发送者的 lane 按 FREE→Cube 写→FIX 完成→PUT 完成→全部 reader ACK→FREE 复用。
+收到某个读者的 ACK 后，发送者才可覆盖该读者的对应 inbox lane。ACK 在输出写完后发布。
 两个槽使 Cube 最多领先两个在途 tile；单 L0C 的复用另由 FIX→M 事件保护，不能用 FREE 代替。
 
-诊断串行基线固定为一个在途 tile：相同 G、tile、math、三次 quiet 和 GET/ACK 协议，
+诊断串行基线固定为一个在途 tile，使用相同 G、tile、math、三次 quiet 和 PUT/READY/ACK 协议。
 每次固定使用 slot=0，不采用 `j%2`；Cube 每轮只获取一次 FREE0，再生产当前 tile，
 两个 AIV 只发/等对应 READY0/FREE0。第二槽仅初始化 FREE1 并在退出时 drain。
 正式入口使用双槽，单槽只作基准配置，不能当作第二个未说明的生产调度路径。
@@ -561,7 +552,7 @@ Golden 与随机数、特殊值构造在 CPU 完成，operator 运行段只做 H
 **先于性能测试执行的发布/复用门禁：** P=2/4/8，每组固定两槽，至少4096代，
 每代 payload 可区分 generation/tile/rank（整数保持在 FP32 精确表示范围内）。
 轮流延迟 producer、consumer 和一个 rank 的 launch，验证看见新 READY 后必能读取对应新 payload，
-且 GET 完成及全部 ACK 之前生产者绝不覆写。实现采用真实 GEMM 的4096次调用：
+且 inbox 读取完成及全部 ACK 之前生产者绝不覆写。实现采用真实 GEMM 的4096次调用：
 `A[0,0]=2^rank`，B 的有效行编码12个 generation bit、rank marker和3个 tile-id bit，
 SUM 的整数值不超过255，在FP16/BF16最终输出中保持精确；因此不向生产kernel添加诊断模式。
 测试覆盖端到端槽位复用及rank启动偏斜，独立的核内producer/consumer延迟仍需设备级检查。
@@ -636,7 +627,7 @@ Q=1 单独报告融合延迟，不纳入“后续 tile 通算重叠”通过数�
 |---|---|
 | quiet 需重新编译安装 | 源码已接入，但未在本机编译或运行；旧安装包不包含此intrinsic |
 | FIX/CV/HCCS 可见性 | 先运行代际 payload 门禁；未通过不调优，不靠 host barrier 掩盖 |
-| 小 M 短消息和三次 quiet 开销 | 测量512B GET、64B控制与quiet成本；不能承诺所有shape全隐藏 |
+| 小 M 短消息和三次 quiet 开销 | 测量 512B tile PUT、64B 控制与 quiet 成本 |
 | 8 rank 冗余数据 | 明确4倍带宽代价；后续RS+AG需要独立协议设计，不悄然切算法 |
 | G 减少并行计算核数 | 同 G 的串行版本隔离重叠收益，框架基线反映整体代价 |
 | 双缓冲尾块残留 | 每版独立逻辑基址、生成代码清零检查、奇数K测试 |

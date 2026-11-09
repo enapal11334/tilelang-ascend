@@ -45,9 +45,9 @@ operator:
       description: "§6，正式路径固定2；1仅用于串行诊断基线"
     - name: algorithm
       type: Enum
-      default: "all_peer_pull"
+      default: "all_peer_push"
       required: false
-      description: "§1，首版唯一通信算法"
+      description: "§1，固定通信算法"
     - name: reduction
       type: Enum
       default: "sum"
@@ -55,7 +55,7 @@ operator:
       description: "§1，固定 SUM"
     - name: protocol_version
       type: Int
-      default: 1
+      default: 2
       required: false
       description: "§7，所有 rank 一致"
   inputs:

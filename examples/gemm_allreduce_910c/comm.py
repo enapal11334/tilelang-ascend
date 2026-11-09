@@ -1,5 +1,6 @@
 """Collective setup and fixed-shape lifetime for the 910C fused kernel."""
 
+from math import prod
 from socket import gethostname
 
 import shmem
@@ -91,7 +92,7 @@ class GemmAllReduce910CContext:
             cores = int(torch.npu.get_device_properties(self.device.index).cube_core_num)
             if cores <= 0:
                 raise RuntimeError("Could not query the current NPU's Cube core count")
-            metadata = (self.shape, str(self.dtype), BM, BN, BK, 1, gethostname(), cores)
+            metadata = (self.shape, str(self.dtype), BM, BN, BK, 2, gethostname(), cores)
         except Exception as exc:
             error = f"rank {self.rank}: {exc}"
         peers = [None] * self.world_size
@@ -109,20 +110,23 @@ class GemmAllReduce910CContext:
         self.groups = min(min(config[-1] for config in configs), max(1, tiles // 2))
         self.rounds = (tiles + self.groups - 1) // self.groups
         self.seq_base = 0
-        if (16384 + 256 * self.world_size) * self.groups > 120 * 1024**2:
+        inbox_shape = [self.groups, 2, self.world_size, BM, BN]
+        flags_shape = [self.groups, 2, 2, self.world_size, 16]
+        workspace_bytes = 4 * (prod(inbox_shape) + prod(flags_shape))
+        if workspace_bytes > 120 * 1024**2:
             raise ValueError("Symmetric workspace exceeds the fixed 128 MiB heap budget")
 
         _init_shmem(self.rank, self.world_size, self.device.index)
         _failed = True
-        self.partial = shmem.aclshmem_create_tensor(
-            [self.groups, 2, BM, BN], dtype=torch.float32, device_id=self.device.index
+        self.inbox = shmem.aclshmem_create_tensor(
+            inbox_shape, dtype=torch.float32, device_id=self.device.index
         )
         self.flags = shmem.aclshmem_create_tensor(
-            [self.groups, 2, 2, self.world_size, 16],
+            flags_shape,
             dtype=torch.int32,
             device_id=self.device.index,
         )
-        if self.partial.data_ptr() % 64 or self.flags.data_ptr() % 64:
+        if self.inbox.data_ptr() % 64 or self.flags.data_ptr() % 64:
             raise RuntimeError("Symmetric workspace must be 64-byte aligned")
         self.kernel = gemm_allreduce_910c(
             m,
@@ -166,7 +170,7 @@ class GemmAllReduce910CContext:
         output = torch.empty((m, n), dtype=self.dtype, device=self.device)
         seq_base = self.seq_base
         self.seq_base += self.rounds
-        self.kernel(a, b, self.partial, self.flags, output, seq_base, stream=self.stream.npu_stream)
+        self.kernel(a, b, self.inbox, self.flags, output, seq_base, stream=self.stream.npu_stream)
         self.failed = _failed = False
         return output
 
@@ -180,7 +184,7 @@ class GemmAllReduce910CContext:
             self.stream.synchronize()
             dist.barrier()
             shmem.aclshmem_free_tensor(self.flags)
-            shmem.aclshmem_free_tensor(self.partial)
+            shmem.aclshmem_free_tensor(self.inbox)
             self.closed = True
             _active, _failed = False, False
 

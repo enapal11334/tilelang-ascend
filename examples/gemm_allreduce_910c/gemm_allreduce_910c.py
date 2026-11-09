@@ -70,9 +70,9 @@ def gemm_allreduce_910c(
     groups: int,
     slots: int = 2,
 ):
-    """Build (A, B, partial, flags, Y, seq_base); slots=1 is the serial baseline.
+    """Build (A, B, inbox, flags, Y, seq_base); slots=1 is the serial baseline.
 
-    The caller owns symmetric partial/flags and advances seq_base by ceildiv(Q,G).
+    The caller owns symmetric inbox/flags and advances seq_base by ceildiv(Q,G).
     All ranks use identical shapes, groups, slot count and sequence intervals.
     """
     n_tiles = (N + BN - 1) // BN
@@ -92,41 +92,18 @@ def gemm_allreduce_910c(
             seen = poll[0]
 
     @T.macro
-    def read_rank(partial, flags, poll, dst, peer_tile, gid, slot, peer, seq, valid_m):
-        if peer == rank:
-            T.copy(partial[gid, slot, 0:valid_m, :], dst)
-        else:
+    def read_rank(inbox, flags, poll, dst, gid, slot, peer, seq, valid_m):
+        if peer != rank:
             wait_state(flags, poll, gid, slot, 0, peer, seq)
-            T.shmem_ub_get_nbi(dst, peer_tile, valid_m * BN, peer)
+        T.copy(inbox[gid, slot, peer, 0:valid_m, :], dst)
         T.set_flag("MTE2", "V", 0)
         T.wait_flag("MTE2", "V", 0)
-        # L0 ones repeat 2, tile 0, before adding this rank's contribution.
-        if (
-            world_size == 4
-            and M == 16
-            and N == 256
-            and K == 128
-            and dtype == "float16"
-            and (rank == 0 or rank == 3)
-            and gid == 0
-            and slot == 0
-            and seq == 11
-        ):
-            T.set_flag("MTE2", "S", 0)
-            T.wait_flag("MTE2", "S", 0)
-            T.printf(
-                "[READ_DEBUG] recv=%d peer=%d seq=%d value=%f\n",
-                rank,
-                peer,
-                seq,
-                dst[0, 0],
-            )
 
     @T.prim_func
     def main(
         A: T.Tensor((M, K), dtype),
         B: T.Tensor((K, N), dtype),
-        partial: T.Tensor((groups, 2, BM, BN), "float32"),
+        inbox: T.Tensor((groups, 2, world_size, BM, BN), "float32"),
         flags: T.Tensor((groups, 2, 2, world_size, 16), "int32"),
         Y: T.Tensor((M, N), dtype),
         seq_base: T.int32,
@@ -198,7 +175,7 @@ def gemm_allreduce_910c(
                                 _compute_panel(a_l1_1, b_l1_1, a_l0_1, b_l0_1, acc_l0c, k, 1)
                         T.set_flag("M", "FIX", 0)
                         T.wait_flag("M", "FIX", 0)
-                        T.copy(acc_l0c, partial[gid, slot, :, :])
+                        T.copy(acc_l0c, inbox[gid, slot, rank, :, :])
                         T.set_flag("FIX", "M", 0)
                         T.set_cross_flag("FIX", slot)
 
@@ -224,36 +201,21 @@ def gemm_allreduce_910c(
                             valid_m = T.min(BM, M - m)
                             valid_n = T.min(BN, N - n)
                             seq = seq_base + j + 1
-                            peer_tile = T.decl_buffer(
-                                (BM * BN,),
-                                "float32",
-                                data=partial.data,
-                                elem_offset=(gid * 2 + slot) * BM * BN,
-                            )
-
-                            # Release payload before a peer can observe READY.
+                            # Publish the local FIX result to each peer's sender lane.
+                            T.copy(inbox[gid, slot, rank, 0:valid_m, :], incoming_ub)
+                            T.set_flag("MTE2", "MTE3", 0)
+                            T.wait_flag("MTE2", "MTE3", 0)
+                            for peer in T.unroll(world_size):
+                                if peer != rank:
+                                    T.shmem_ub_put_nbi(
+                                        incoming_ub,
+                                        inbox,
+                                        valid_m * BN,
+                                        peer,
+                                        ((gid * 2 + slot) * world_size + rank) * BM * BN,
+                                    )
+                            # Complete payload PUTs before peers can observe READY.
                             T.shmem_quiet()
-                            # Check the producer's local view before advertising this tile.
-                            if (
-                                world_size == 4
-                                and M == 16
-                                and N == 256
-                                and K == 128
-                                and dtype == "float16"
-                                and rank == 2
-                                and gid == 0
-                                and slot == 0
-                                and seq == 11
-                            ):
-                                T.copy(partial[gid, slot, 0:valid_m, :], incoming_ub)
-                                T.set_flag("MTE2", "S", 0)
-                                T.wait_flag("MTE2", "S", 0)
-                                T.printf(
-                                    "[PUBLISH_DEBUG] rank=%d seq=%d value=%f\n",
-                                    rank,
-                                    seq,
-                                    incoming_ub[0, 0],
-                                )
                             T.tile.fill(seq_ub, seq)
                             T.set_flag("V", "MTE3", 0)
                             T.wait_flag("V", "MTE3", 0)
@@ -269,27 +231,15 @@ def gemm_allreduce_910c(
                             T.shmem_quiet()
 
                             # Identical FP32 rank order on every destination rank.
-                            read_rank(
-                                partial,
-                                flags,
-                                poll_ub,
-                                acc_ub,
-                                peer_tile,
-                                gid,
-                                slot,
-                                0,
-                                seq,
-                                valid_m,
-                            )
+                            read_rank(inbox, flags, poll_ub, acc_ub, gid, slot, 0, seq, valid_m)
                             for peer in T.unroll(1, world_size):
                                 T.set_flag("V", "MTE2", 0)
                                 T.wait_flag("V", "MTE2", 0)
                                 read_rank(
-                                    partial,
+                                    inbox,
                                     flags,
                                     poll_ub,
                                     incoming_ub,
-                                    peer_tile,
                                     gid,
                                     slot,
                                     peer,
@@ -308,7 +258,7 @@ def gemm_allreduce_910c(
                             T.set_flag("MTE3", "S", 0)
                             T.wait_flag("MTE3", "S", 0)
 
-                            # ACK follows all GETs and output completion, before any ACK wait.
+                            # ACK lets each producer reuse its lane after the output write.
                             for peer in T.unroll(world_size):
                                 if peer != rank:
                                     T.shmem_ub_put_nbi(
