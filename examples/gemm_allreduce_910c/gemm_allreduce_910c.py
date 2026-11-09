@@ -233,6 +233,27 @@ def gemm_allreduce_910c(
 
                             # Release payload before a peer can observe READY.
                             T.shmem_quiet()
+                            # Check the producer's local view before advertising this tile.
+                            if (
+                                world_size == 4
+                                and M == 16
+                                and N == 256
+                                and K == 128
+                                and dtype == "float16"
+                                and rank == 2
+                                and gid == 0
+                                and slot == 0
+                                and seq == 11
+                            ):
+                                T.copy(partial[gid, slot, 0:valid_m, :], incoming_ub)
+                                T.set_flag("MTE2", "S", 0)
+                                T.wait_flag("MTE2", "S", 0)
+                                T.printf(
+                                    "[PUBLISH_DEBUG] rank=%d seq=%d value=%f\n",
+                                    rank,
+                                    seq,
+                                    incoming_ub[0, 0],
+                                )
                             T.tile.fill(seq_ub, seq)
                             T.set_flag("V", "MTE3", 0)
                             T.wait_flag("V", "MTE3", 0)
